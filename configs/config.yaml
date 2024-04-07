@@ -1,13 +1,13 @@
-model: /model-weights/Llama-2-7b-chat-hf
+model: /model-weights/Llama-2-7b-chat-hf/
 enable_wandb_logging: True
 
 wandb_config:
   project: MedGPT
-  name: Llama-2-7B-chat-ft-mdpi-mtb-main
+  name: Llama-2-7B-chat
 
 train_parameters:
   output_dir: your/output/dir
-  max_seq_len: 1024
+  max_seq_len: 4096
   epochs: 1
   seed: 11
 
@@ -18,6 +18,7 @@ train_parameters:
   use_mp: True
   use_activation_checkpointing: True
   use_flash_attention: True
+  low_cpu_mem_usage: True
 
   # Gradient norm clipping
   max_grad_norm: 1
@@ -53,7 +54,6 @@ dataset_preprocess:
   packing_type: partial
   add_bos_eos_tokens: True
   from_disk: True
-  seperator: "Excerpt:"
   load_path: your/unprocessed/dataset
   split: train
   save_path: dir/to/save/processed/dataset

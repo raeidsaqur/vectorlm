@@ -6,23 +6,21 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+import wandb
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler, ReduceLROnPlateau
 from transformers import PreTrainedTokenizer
 
-import wandb
 from vectorlm.dataset import Dataset
 from vectorlm.utils.data_utils import Config
 from vectorlm.utils.save_utils import (
     checkpoint_exists,
     get_latest_checkpoint_dir,
     load_metadata,
-    load_model,
-    load_optimizer,
+    load_model_and_optimizer,
     load_scheduler,
     save_metadata,
-    save_model,
-    save_optimizer,
+    save_model_and_optimizer,
     save_scheduler,
 )
 
@@ -47,6 +45,7 @@ class Trainer:
             epoch.
         max_steps: An integer maximum number of training steps for this run.
         saving_steps: An integer for how often we save.
+
     """
 
     def __init__(self,
@@ -62,6 +61,7 @@ class Trainer:
             enable_wandb_logging: Whether to enable wandb logging.
             original_dataset_length: The length of the original dataset
                 (divided by the batch size).
+
         """
         self.config = config
         self.gas = config.gradient_accumulation_steps
@@ -114,6 +114,7 @@ class Trainer:
             dataset: The `Dataset` class.
             optimizer: The training optimizer.
             lr_scheduler: The LR scheduler.
+
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -127,6 +128,7 @@ class Trainer:
         Args:
         ----
             epoch: The current training epoch.
+
         """
         rank = dist.get_rank()
         gathered_processed_ids = _gather(
@@ -145,8 +147,7 @@ class Trainer:
         )
         if rank == 0:
             save_metadata(save_dir, meta_dict)
-        save_model(self.model, save_dir, rank)
-        save_optimizer(self.optimizer, self.model, save_dir, rank)
+        save_model_and_optimizer(self.optimizer, self.model, save_dir, rank)
         save_scheduler(self.lr_scheduler, save_dir, rank)
         dist.barrier()
 
@@ -161,14 +162,14 @@ class Trainer:
         Returns:
         -------
             The checkpointed epoch to be used by the outer loop.
+
         """
         rank = dist.get_rank()
         step, epoch, ids = load_metadata(checkpoint_dir)
         self.tr_step = step
         self.dataset.set_processed_ids(ids)
         self.dataset.setup_dataloaders()
-        load_model(self.model, checkpoint_dir, rank)
-        load_optimizer(self.optimizer, self.model, checkpoint_dir, rank)
+        load_model_and_optimizer(self.optimizer, self.model, checkpoint_dir)
         load_scheduler(self.lr_scheduler, checkpoint_dir, rank)
         dist.barrier()
         return epoch
@@ -184,6 +185,7 @@ class Trainer:
         -------
             The checkpointed epoch. If no checkpoint exists, it returns a
             default value of 0.
+
         """
         checkpoint = checkpoint_exists(checkpoint_dir)
         if checkpoint:
@@ -210,6 +212,7 @@ class Trainer:
         ----
             train_batch: The training batch.
             epoch: The current training epoch.
+
         """
         if (
             self.config.checkpointing_enabled
@@ -234,6 +237,7 @@ class Trainer:
         ----
             batch: The training batch.
             epoch: The current training epoch.
+
         """
         ids = batch.pop("id").to(torch.cuda.current_device())
         batch["input_ids"] = batch["input_ids"].type(torch.LongTensor)
@@ -274,6 +278,7 @@ class Trainer:
         Args:
         ----
             epoch: The current training epoch.
+
         """
         print_main("Evaluating")
         self.model.eval()
@@ -305,6 +310,7 @@ class Trainer:
             loss: The loss being logged.
             epoch: The current training epoch.
             mode: One of `train` or `eval`.
+
         """
         if mode not in {"train", "eval"}:
             msg = "`mode` argument needs to be 'train' or 'eval'."
