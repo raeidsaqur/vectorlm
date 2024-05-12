@@ -5,17 +5,14 @@ import math
 import os
 import sys
 from argparse import Namespace
-from typing import TYPE_CHECKING, Callable
 
 import torch
 import torch.distributed as dist
 from torch.optim import AdamW
 from tqdm import tqdm
 from transformers import set_seed
-from vllm import SamplingParams
 
 from vectorlm.dataset import Dataset
-from vectorlm.sampling import LoRASamplingEngine
 from vectorlm.trainer import Trainer
 from vectorlm.utils.data_utils import Config
 from vectorlm.utils.misc_utils import cleanup, setup, wandb_setup
@@ -26,17 +23,7 @@ from vectorlm.utils.model_utils import (
     shard_model,
 )
 from vectorlm.utils.optimizer_utils import get_custom_scheduler
-from vectorlm.utils.save_utils import (
-    checkpoint_exists,
-    get_latest_checkpoint_dir,
-    save_consolidated_model,
-    save_peft_adapter,
-)
-
-if TYPE_CHECKING:
-    from vllm import LLM
-
-    from vectorlm.sampling.utils import SynchronizationBarriers
+from vectorlm.utils.save_utils import save_consolidated_model
 
 
 def parse_args() -> Namespace:
@@ -56,56 +43,27 @@ def parse_args() -> Namespace:
     return parser.parse_args()
 
 
-def main(
-    config: Config,
-    local_rank: int | None = None,
-    world_size: int | None = None,
-    barriers: SynchronizationBarriers | None = None,
-    get_vllm_llm: Callable[[], LLM] | None = None,
-) -> None:
-    """Define the main calling function.
-
-    Args:
-    ----
-        config: vectorlm config, e.g., loaded from yaml
-        local_rank: int, where 0 is root process, one process per accelerator.
-        world_size: number of processes.
-        barriers: SynchronizationBarriers, required for all processes.
-        get_vllm_llm: required only for root process (rank 0).
-
-    """
-    if barriers is not None:
-        # Wait until vllm engine is fully initialized.
-        print(f"rank {local_rank} vllm_init_barrier wait")
-        barriers.vllm_init.wait()
-        print(f"rank {local_rank} vllm_init_barrier cleared")
-
+def main(config: Config) -> None:
+    """Define the main calling function."""
     training_args = config.train_parameters
-    sampler_config = training_args.get("sampler")
 
     # set a seed
     set_seed(training_args.seed)
 
+    # set CUDA related dependencies
+    local_rank = int(os.environ["LOCAL_RANK"])
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+
+    print(f"Rank: {rank}, World size: {world_size}")
     if dist.is_initialized():
         torch.cuda.set_device(local_rank)
         torch.cuda.empty_cache()
 
-    # set CUDA related dependencies
-    if (local_rank is None) or (world_size is None):
-        local_rank = int(os.environ["LOCAL_RANK"])
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-    else:
-        rank = local_rank  # modify if going beyond one node.
-        os.environ["LOCAL_RANK"] = str(local_rank)
-        os.environ["RANK"] = str(local_rank)
-        os.environ["WORLD_SIZE"] = str(world_size)
-
-    print(f"Rank: {rank}, World size: {world_size}")
-
     # setup wandb
-    if rank == 0 and config.enable_wandb_logging:
+    if rank == 0:
         wandb_setup(config, **config.wandb_config)
+    dist.barrier()
 
     # load model and tokenizer
     model, tokenizer = load_model_and_tokenizer(
@@ -117,42 +75,23 @@ def main(
         training_args.low_cpu_mem_usage,
     )
 
-    lora_peft_config = config.train_parameters.get("lora_peft_config")
-    is_peft_adapter_restored = False
-    is_lora_enabled = False
+    lora_peft_config = getattr(
+        config.train_parameters,
+        "lora_peft_config",
+        None,
+    )
     if lora_peft_config is not None:
-        is_lora_enabled = True
-        peft_adapter_path = None
-        # Restore peft adapter from filesystem if available.
-        if (training_args.checkpointing_enabled) and checkpoint_exists(
-            training_args.output_dir,
-        ):
-            peft_adapter_path = os.path.join(
-                training_args.output_dir,
-                "checkpoints",
-                get_latest_checkpoint_dir(
-                    os.path.join(training_args.output_dir, "checkpoints"),
-                ),
-            )
-            is_peft_adapter_restored = True
-
-        model = get_lora_model_from_base_model(
-            model,
-            lora_peft_config,
-            peft_adapter_path,
-        )
+        model = get_lora_model_from_base_model(model, lora_peft_config)
 
     decoder_layer_module = get_submodule_by_pattern(model, r"DecoderLayer$")
-    assert decoder_layer_module is not None, f"No DecoderLayer found in {model}"
     model = shard_model(
-        model,
+        model.bfloat16(),
         decoder_layer_module,
         training_args.use_mp,
         training_args.use_activation_checkpointing,
         training_args.sharding_strategy,
         local_rank,
         training_args.low_cpu_mem_usage,
-        is_lora_enabled,
     )
 
     # load dataset
@@ -190,25 +129,14 @@ def main(
         dataset,
         optimizer,
         lr_scheduler,
-        is_peft_adapter_restored,
     )
-
-    if sampler_config is not None:
-        # vllm_llm is required only on rank 0.
-        vllm_llm = get_vllm_llm() if get_vllm_llm is not None else None
-        sampling_engine = LoRASamplingEngine(
-            trainer,
-            vllm_llm,  # required only for rank 0
-            SamplingParams(seed=0, temperature=0),
-            barriers,
-        )
-        trainer.sampling_engine = sampling_engine
 
     # Checkpoint check. Always call before training.
     # If no checkpoint, it returns 0.
     checkpointed_epoch = trainer.find_checkpoint(training_args.output_dir)
 
     for epoch in range(checkpointed_epoch, training_args.epochs):
+        trainer.model.train()
         train_dl_iterator = iter(dataset.train_dataloader)
         for _ in tqdm(
             range(len(dataset.train_dataloader)),
@@ -217,7 +145,6 @@ def main(
         ):
             batch = next(train_dl_iterator)
             trainer.step(batch, epoch)
-            dist.barrier()
 
         if epoch == training_args.epochs - 1:
             hf_save_dir = os.path.join(training_args.output_dir, "final-model")
@@ -228,14 +155,8 @@ def main(
                 f"epoch_{epoch}",
                 "end-epoch-model",
             )
-
-        if is_lora_enabled:
-            save_peft_adapter(trainer.model, hf_save_dir)
-        else:
-            save_consolidated_model(trainer.model, hf_save_dir, rank)
+        save_consolidated_model(trainer.model, hf_save_dir, rank)
         dataset.reset_dataloaders()
-
-    sys.exit(0)
 
 
 if __name__ == "__main__":
